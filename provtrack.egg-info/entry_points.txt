@@ -1,0 +1,2 @@
+[console_scripts]
+provtrack = provtrack.cli:main

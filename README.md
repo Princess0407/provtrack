@@ -1,0 +1,189 @@
+# provtrack
+
+**Zero-instrumentation ML pipeline provenance tracking.**
+
+MLflow tracks your hyperparameters and final metrics. It doesn't track what happened to your data between loading the CSV and calling `fit()`. provtrack does.
+
+```python
+import provtrack
+provtrack.activate()
+
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+df = pd.read_csv("data.csv")       # auto-wrapped
+df = df.dropna()
+df = df[df["age"] > 18]
+
+scaler = provtrack.wrap(StandardScaler())
+X = scaler.fit_transform(df)
+
+print(provtrack.lineage().summary())
+# Pipeline with 4 operations and 3 data-flow edges.
+# Execution order: read_csv -> dropna -> __getitem__ -> fit_transform
+```
+
+One line added. Full lineage captured.
+
+---
+
+## Why this exists
+
+When a production model breaks three months later, you need to answer: *exactly what sequence of operations produced this model?*
+
+MLflow answers what hyperparameters you used. It doesn't answer what happened to the data *between* API calls — the `dropna()`, the boolean filter, the column rename. Those intermediate pandas operations are invisible to every existing tool.
+
+provtrack instruments at the Python object level, not the API level. Every DataFrame method call is intercepted transparently via `__getattr__` proxy. The result is a complete DAG of every operation that touched your data, with cryptographic hashes linking each step.
+
+| Tool | Approach | Tracks intermediate pandas ops | Zero instrumentation |
+|------|----------|--------------------------------|----------------------|
+| MLflow | explicit logging | ❌ | ❌ |
+| mlinspect | AST rewriting | partial | ❌ (brittle) |
+| Vamsa | static analysis | ❌ (dynamic code) | ❌ |
+| DataLineagePy | runtime proxy | ✅ | ❌ (explicit wrapping required) |
+| **provtrack** | **runtime proxy** | **✅** | **✅** |
+
+---
+
+## Install
+
+```bash
+pip install provtrack
+```
+
+With sklearn support:
+
+```bash
+pip install provtrack[sklearn]
+```
+
+---
+
+## Quick start
+
+```python
+import provtrack
+provtrack.activate()   # one line — that's it
+
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+df = pd.read_csv("train.csv")
+df = df.dropna()
+df = df.rename(columns={"label": "y"})
+
+scaler = provtrack.wrap(StandardScaler())
+X = scaler.fit_transform(df.drop("y", axis=1))
+
+# Get the full lineage.
+graph = provtrack.lineage()
+print(graph.summary())
+
+# Export to Mermaid (renders in GitHub README / Notion).
+print(graph.to_mermaid())
+
+# Export to Graphviz DOT.
+print(graph.to_dot())
+
+# Save session to disk.
+import json
+with open("session.json", "w") as f:
+    f.write(graph.to_json())
+```
+
+---
+
+## CLI
+
+```bash
+# Human-readable report.
+provtrack report --file session.json
+
+# Export to Mermaid.
+provtrack export --file session.json --format mermaid
+
+# Find all operations that touched a specific data hash.
+provtrack query --file session.json --hash <sha256>
+
+# Find all pandas operations.
+provtrack query --file session.json --tag pandas
+
+# Compare two pipeline runs.
+provtrack diff --a session_v1.json --b session_v2.json
+
+# Validate the lineage graph is a valid DAG.
+provtrack validate --file session.json
+```
+
+---
+
+## How it works
+
+### Layer 1: Hashing
+
+Every DataFrame state is fingerprinted with SHA-256 via `pd.util.hash_pandas_object`. Two operations are linked in the DAG when `output_hash(op_A) == input_hash(op_B)`.
+
+### Layer 2: Proxy interception
+
+`DataFrameProxy` wraps a `pd.DataFrame`. When any method is called on the proxy, `__getattr__` fires first, logs the operation, then delegates to the real DataFrame. If the return value is a DataFrame, it's re-wrapped so chained operations are tracked automatically.
+
+```python
+proxy.dropna().reset_index().rename(columns={"a": "b"})
+# All three calls are intercepted and logged.
+```
+
+### Layer 3: DAG construction
+
+Operations form a directed acyclic graph (networkx `DiGraph`). Nodes are operations; edges are data flows linked by hash. The graph enables lineage queries like "show me all ancestors of this model" or "what operations touched column X."
+
+### Layer 4: Activation
+
+`provtrack.activate()` patches `pd.read_csv`, `pd.read_parquet`, `pd.read_json`, and `pd.read_excel` so their output is automatically wrapped. sklearn estimators are wrapped via `provtrack.wrap()`.
+
+---
+
+## Architecture
+
+```
+provtrack/
+├── hasher.py      — SHA-256 fingerprinting of DataFrame states
+├── logger.py      — Immutable OperationRecord storage (thread-safe singleton)
+├── graph.py       — NetworkX DAG: nodes = ops, edges = data flows
+├── proxy.py       — DataFrameProxy + EstimatorProxy
+├── activate.py    — Patches pandas I/O functions; public API
+└── cli.py         — report / export / query / diff / validate
+```
+
+---
+
+## Performance
+
+Overhead is bounded by SHA-256 hashing. On a MacBook Pro M2:
+
+| DataFrame size | Hash time |
+|----------------|-----------|
+| 1K rows × 10 cols | ~0.3 ms |
+| 100K rows × 10 cols | ~25 ms |
+| 1M+ rows | sampled → ~25 ms |
+
+DataFrames with more than 100,000 rows use reservoir sampling (configurable). The proxy wrapper itself adds ~0.01 ms per call.
+
+---
+
+## Contributing
+
+See `INTERNALS.md` for architecture notes and design decisions.
+
+```bash
+git clone https://github.com/Princess0407/provtrack
+cd provtrack
+python -m venv venv && source venv/bin/activate
+pip install -e ".[dev]"
+pytest tests/ -v
+```
+
+---
+
+## License
+
+Apache 2.0
