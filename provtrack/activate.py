@@ -1,200 +1,160 @@
-"""
-provtrack.activate
-~~~~~~~~~~~~~~~~~~
-One-line activation: patches pandas DataFrame construction and sklearn
-estimator init so every new object is automatically wrapped in a proxy.
-
-Patching strategy
------------------
-We patch at the class level (not import hooks):
-
-  pd.DataFrame.__init_subclass__ — wraps the returned instance after init.
-  pd.read_csv / pd.read_parquet / pd.read_json / pd.read_excel — wrap output.
-  sklearn.base.BaseEstimator.__init_subclass__ — wraps new estimator instances.
-
-We do NOT use import hooks (sys.meta_path / importlib) because they're fragile
-with warm Jupyter kernels and hard to reason about in production.  Class-level
-patching is explicit and reversible.
-
-Thread safety
--------------
-activate() / deactivate() acquire a module lock.  Patching itself is not
-atomic, but it's only done once at session start so race conditions are
-extremely unlikely.  In multi-process setups, each process must call activate().
-
-Security guardrails
--------------------
-  - activate() is idempotent: calling it twice is safe.
-  - deactivate() fully restores all original methods.
-  - We never monkey-patch stdlib builtins.
-  - The patch table is stored in a private dict; it cannot be modified from
-    outside this module.
-"""
-
 from __future__ import annotations
 
+import logging
+import sys
 import threading
-import warnings
-from typing import Any, Callable, Dict, Optional, Tuple
-import warnings as _warnings
+import time
+import uuid
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-# pandas is an optional dependency for provtrack.  Defer import errors
-# until functionality that requires pandas is used so users can still import
-# provtrack in environments without pandas installed.
 try:
-    import pandas as pd  # type: ignore
-except Exception:  # ImportError or other import-time issues
-    pd = None  # type: ignore
+    import pandas as pd
+except Exception:
+    pd = None
 
-from .proxy import DataFrameProxy, EstimatorProxy, get_graph, reset_graph
-from .logger import get_logger, reset_logger
+from provtrack.backends.base import Backend
+from provtrack.backends.memory import MemoryBackend
+from provtrack.backends.postgres import PostgresBackend
+from provtrack.backends.s3 import S3Backend
+from provtrack.backends.sqlite import SQLiteBackend
+from provtrack.graph.builder import LineageGraph, ProvenanceGraph
+from provtrack.hashers.dataframe import PandasHasher
+from provtrack.logger import OperationRecord, get_logger, reset_logger
+from provtrack.proxies.dataframe import DataFrameProxy
+from provtrack.proxies.estimator import EstimatorProxy
+from provtrack.proxies.spark import SparkProxy
+from provtrack.proxies.tensor import TensorProxy
 
-# ── state ─────────────────────────────────────────────────────────────────────
+TOOL_ID: int = 1
+_SYS_MONITORING_AVAILABLE: bool = sys.version_info >= (3, 12)
+logger = logging.getLogger(__name__)
 
 _activated: bool = False
 _lock = threading.Lock()
+_backend: Optional[Backend] = None
+_graph: Optional[LineageGraph] = None
+_run_id: str = str(uuid.uuid4())
 
-# Stores (object, attr_name, original_callable) for clean rollback.
+_pandas_hasher = PandasHasher()
+_local = threading.local()
 _patches: Dict[str, Tuple[Any, str, Callable]] = {}
 
-
-# ── internal patch helpers ────────────────────────────────────────────────────
-
-def _wrap_pd_reader(original: Callable, name: str) -> Callable:
-    """Wrap a pd.read_* function so its output is a DataFrameProxy."""
-    def _wrapped(*args: Any, **kwargs: Any) -> DataFrameProxy:
-        result = original(*args, **kwargs)
-        if pd is not None and isinstance(result, pd.DataFrame):
-            rec = get_logger().record(
-                op_name=name,
-                obj_type="DataFrame",
-                input_hash="__source__",
-                output_hash=None,  # filled after hashing below
-                args=args,
-                kwargs=kwargs,
-                duration_ms=0.0,
-                tags=("pandas", "io"),
-            )
-            proxy = DataFrameProxy(result)
-            # Retroactively set output_hash on the record (graph node already added).
-            # We rebuild the record as a new immutable one and swap.
-            from .logger import OperationRecord  # noqa: PLC0415
-            import dataclasses  # noqa: PLC0415
-            fixed_rec = dataclasses.replace(rec, output_hash=proxy.current_hash)
-            # Re-add to graph with corrected hash.
-            get_graph().add_record(fixed_rec)
-            return proxy
-        return result
-    _wrapped.__name__ = name
-    return _wrapped
+_INTERNAL_PATH_PARTS = (
+    "/provtrack/activate.py",
+    "/provtrack/logger.py",
+    "/provtrack/hasher.py",
+    "/provtrack/proxy.py",
+    "/provtrack/hashers/",
+    "/provtrack/backends/",
+    "/provtrack/proxies/",
+    "/provtrack/graph/",
+    "/provtrack/exporters/",
+)
 
 
-def _wrap_pd_constructor() -> None:
-    """
-    Patch pd.DataFrame so calling pd.DataFrame(...) returns a DataFrameProxy
-    when provtrack is active.
-
-    We override __new__ on a subclass and then replace pd.DataFrame in the
-    pandas namespace.  This is intentionally minimal — we only override __new__
-    to avoid breaking internal pandas code that calls type(self)(...) directly.
-    """
-    # Keep the real DataFrame available for internal use.
-    pass  # pandas constructors are handled via pd.read_* wrappers in v1.
-    # Full constructor patch is a v2 feature (requires extensive compatibility testing).
+def _is_internal_file(filename: str) -> bool:
+    norm = filename.replace("\\", "/")
+    if "pandas" in norm or "sklearn" in norm:
+        return True
+    return any(part in norm for part in _INTERNAL_PATH_PARTS)
 
 
-# ── public API ────────────────────────────────────────────────────────────────
-
-def activate(
-    *,
-    patch_sklearn: bool = True,
-    patch_pandas_readers: bool = True,
-    verbose: bool = False,
-) -> None:
-    """
-    Activate provtrack for the current Python process.
-
-    After calling activate(), every pd.read_csv / read_parquet / read_json /
-    read_excel call returns a DataFrameProxy, and every sklearn estimator
-    method (fit, transform, predict, …) is logged automatically.
-
-    Parameters
-    ----------
-    patch_sklearn : bool
-        If True, wrap sklearn estimator methods.  Default True.
-    patch_pandas_readers : bool
-        If True, wrap pd.read_csv / read_parquet / read_json / read_excel.
-        Default True.
-    verbose : bool
-        If True, print a confirmation message on activation.  Default False.
-
-    Raises
-    ------
-    RuntimeError
-        If called from a non-main thread without explicit thread-safe setup.
-    """
-    global _activated
-
-    with _lock:
-        if _activated:
-            if verbose:
-                print("[provtrack] Already active — skipping re-activation.")
-            return
-
-        if patch_pandas_readers:
-            _patch_pandas_readers()
-
-        if patch_sklearn:
-            _patch_sklearn()
-
-        _activated = True
-
-    if verbose:
-        print(
-            "[provtrack] Activated. "
-            f"Tracking pandas={'yes' if patch_pandas_readers else 'no'}, "
-            f"sklearn={'yes' if patch_sklearn else 'no'}."
-        )
+def _get_pending() -> Tuple[Dict[int, Tuple[str, str]], Dict[Tuple[int, int], Tuple[str, str, Any, Any, float]]]:
+    if not hasattr(_local, "pending_calls"):
+        _local.pending_calls = {}
+        _local.frame_calls = {}
+    return _local.pending_calls, _local.frame_calls
 
 
-def deactivate() -> None:
-    """
-    Restore all original pandas / sklearn callables and clear tracking state.
+def _on_call(code: Any, instruction_offset: int, callable_: Any, arg0: Any) -> Any:
+    module = getattr(callable_, "__module__", "") or ""
+    qualname = getattr(callable_, "__qualname__", "") or ""
+    if "pandas" not in module and "sklearn" not in module:
+        return sys.monitoring.DISABLE
 
-    After deactivate(), pd.read_csv etc. behave exactly as they did before
-    provtrack was imported.
-    """
-    global _activated
+    pending_calls, frame_calls = _get_pending()
+    pending_calls[id(callable_)] = (qualname, module)
 
-    with _lock:
-        for key, (obj, attr, original) in _patches.items():
-            try:
-                setattr(obj, attr, original)
-            except (AttributeError, TypeError):
-                warnings.warn(
-                    f"provtrack: could not restore {key} — ignoring.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-        _patches.clear()
-        _activated = False
+    frame = sys._getframe(1)
+    frame_calls[(id(frame), instruction_offset)] = (
+        qualname,
+        module,
+        getattr(callable_, "__self__", None),
+        arg0,
+        time.perf_counter(),
+    )
+    return None
 
 
-def reset() -> None:
-    """
-    Discard all recorded operations and the current lineage graph.
+def _on_return(code: Any, instruction_offset: int, retval: Any) -> Any:
+    try:
+        df_cls = getattr(pd, "DataFrame", None)
+        if df_cls is None or not isinstance(retval, df_cls):
+            return None
+    except (TypeError, AttributeError):
+        return None
 
-    activate() state is preserved — tracking continues on the next operation.
-    """
-    reset_logger()
-    reset_graph()
+    frame = sys._getframe(1)
+    caller = frame.f_back
+    if not caller:
+        return None
 
+    caller_file = caller.f_code.co_filename
+    if _is_internal_file(caller_file):
+        return None
 
-def is_active() -> bool:
-    return _activated
+    pending_calls, frame_calls = _get_pending()
+    key = (id(caller), caller.f_lasti)
+    call_info = frame_calls.pop(key, None)
 
+    op_name = code.co_name
+    input_hash: Optional[str] = None
+    duration_ms = 0.0
+    tags = ("pandas",)
 
-# ── pandas reader patching ────────────────────────────────────────────────────
+    if call_info:
+        qualname, module, self_obj, arg0, t_start = call_info
+        duration_ms = (time.perf_counter() - t_start) * 1000
+        op_name = qualname.split(".")[-1] or code.co_name
+        if "sklearn" in module:
+            tags = ("sklearn",)
+
+        if isinstance(self_obj, pd.DataFrame):
+            input_hash = _pandas_hasher.hash(self_obj)
+        elif isinstance(arg0, pd.DataFrame):
+            input_hash = _pandas_hasher.hash(arg0)
+        elif isinstance(arg0, (list, tuple)):
+            for item in arg0:
+                if isinstance(item, pd.DataFrame):
+                    input_hash = _pandas_hasher.hash(item)
+                    break
+
+    output_hash = _pandas_hasher.hash(retval)
+    if input_hash is None and op_name.startswith("read_"):
+        input_hash = "__source__"
+
+    rec = OperationRecord(
+        id=str(uuid.uuid4()),
+        op_name=op_name,
+        obj_type=type(retval).__name__,
+        input_hash=input_hash,
+        output_hash=output_hash,
+        timestamp=time.time(),
+        source_line=caller.f_lineno,
+        source_file=caller_file,
+        tags=tags,
+        args_repr="",
+        duration_ms=round(duration_ms, 3),
+        caller_func=caller.f_code.co_name,
+    )
+
+    if _backend is not None:
+        _backend.save([rec])
+    if _graph is not None:
+        _graph.add_record(rec)
+
+    return None
+
 
 _PD_READERS = [
     "read_csv",
@@ -212,7 +172,37 @@ _PD_READERS = [
 ]
 
 
-def _patch_pandas_readers() -> None:
+def _wrap_pd_reader(original: Callable, name: str) -> Callable:
+    def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        result = original(*args, **kwargs)
+        if pd is not None and isinstance(result, pd.DataFrame):
+            rec = get_logger().record(
+                op_name=name,
+                obj_type="DataFrame",
+                input_hash="__source__",
+                output_hash=None,
+                args=args,
+                kwargs=kwargs,
+                duration_ms=0.0,
+                tags=("pandas", "io"),
+            )
+            proxy = DataFrameProxy(result)
+            import dataclasses
+            fixed_rec = dataclasses.replace(rec, output_hash=proxy.current_hash)
+            if _backend is not None:
+                _backend.save([fixed_rec])
+            if _graph is not None:
+                _graph.add_record(fixed_rec)
+            return proxy
+        return result
+
+    _wrapped.__name__ = name
+    return _wrapped
+
+
+def _setup_v1_fallback(patch_readers: bool = True) -> None:
+    if pd is None or not patch_readers:
+        return
     for reader_name in _PD_READERS:
         original = getattr(pd, reader_name, None)
         if original is None:
@@ -222,65 +212,150 @@ def _patch_pandas_readers() -> None:
         _patches[f"pd.{reader_name}"] = (pd, reader_name, original)
 
 
-# ── sklearn patching ──────────────────────────────────────────────────────────
+def activate(
+    backend: Union[str, Backend] = "memory",
+    db_path: Optional[str] = None,
+    dsn: Optional[str] = None,
+    s3_uri: Optional[str] = None,
+    *,
+    patch_sklearn: bool = True,
+    patch_pandas_readers: bool = True,
+    verbose: bool = False,
+    **backend_kwargs: Any,
+) -> None:
+    global _activated, _backend, _graph, _run_id
 
-def _patch_sklearn() -> None:
-    try:
-        import sklearn.base as skbase  # noqa: PLC0415
-    except ImportError:
-        warnings.warn(
-            "provtrack: sklearn not found — estimator tracking disabled.",
-            ImportWarning,
-            stacklevel=3,
-        )
-        return
+    with _lock:
+        if _activated:
+            if verbose:
+                logger.debug("[provtrack] Already active.")
+            return
 
-    original_init = skbase.BaseEstimator.__init__
+        _run_id = str(uuid.uuid4())
+        _graph = LineageGraph()
 
-    def _patched_init(self_est, *args: Any, **kwargs: Any) -> None:
-        original_init(self_est, *args, **kwargs)
-        # We don't wrap the estimator here; we wrap it at the call site in
-        # EstimatorProxy.__getattr__.  This keeps the init patch lightweight.
+        if isinstance(backend, Backend):
+            _backend = backend
+        elif backend == "memory":
+            _backend = MemoryBackend()
+        elif backend == "sqlite":
+            _backend = SQLiteBackend(db_path=db_path or "lineage.db", **backend_kwargs)
+        elif backend == "postgres":
+            _backend = PostgresBackend(dsn=dsn, **backend_kwargs)
+        elif backend == "s3":
+            _backend = S3Backend(s3_uri=s3_uri, **backend_kwargs)
+        else:
+            raise ValueError(f"Unknown backend: {backend}. Choose memory, sqlite, postgres, or s3.")
 
-    # v1: We rely on the user wrapping estimators explicitly via:
-    #   scaler = provtrack.wrap(StandardScaler())
-    # Full auto-wrapping of every estimator init is complex (breaks __init__
-    # argument introspection in sklearn's clone()) and is deferred to v2.
-    pass
+        if _SYS_MONITORING_AVAILABLE:
+            try:
+                sys.monitoring.use_tool_id(TOOL_ID, "provtrack")
+            except ValueError:
+                pass
+            sys.monitoring.set_events(TOOL_ID, sys.monitoring.events.CALL | sys.monitoring.events.PY_RETURN)
+            sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.CALL, _on_call)
+            sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.PY_RETURN, _on_return)
+        else:
+            _setup_v1_fallback(patch_readers=patch_pandas_readers)
+
+        _activated = True
 
 
-# ── wrap() helper for manual wrapping ────────────────────────────────────────
+def deactivate() -> None:
+    global _activated, _backend, _graph
+
+    with _lock:
+        if not _activated:
+            return
+
+        if _SYS_MONITORING_AVAILABLE:
+            try:
+                sys.monitoring.set_events(TOOL_ID, 0)
+                sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.CALL, None)
+                sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.PY_RETURN, None)
+                sys.monitoring.free_tool_id(TOOL_ID)
+            except Exception:
+                pass
+        else:
+            for key, (obj, attr, original) in _patches.items():
+                try:
+                    setattr(obj, attr, original)
+                except (AttributeError, TypeError):
+                    pass
+            _patches.clear()
+
+        if isinstance(_backend, MemoryBackend):
+            _backend.clear()
+
+        reset_logger()
+        _backend = None
+        _graph = None
+        _activated = False
+
+
+def reset() -> None:
+    global _graph
+    with _lock:
+        if _backend is not None:
+            _backend.clear()
+        _graph = LineageGraph()
+        reset_logger()
+
+
+def is_active() -> bool:
+    return _activated
+
+
+def get_backend() -> Optional[Backend]:
+    return _backend
+
+
+def get_run_id() -> str:
+    return _run_id
+
+
+def get_lineage() -> LineageGraph:
+    if _backend is not None:
+        records = _backend.load()
+        return LineageGraph.from_records(records)
+    if _graph is not None:
+        return _graph
+    return LineageGraph()
+
+
+def lineage() -> LineageGraph:
+    return get_lineage()
+
+
+def get_records() -> List[OperationRecord]:
+    if _backend is not None:
+        return _backend.load()
+    if not _activated:
+        return []
+    return get_logger().all()
+
+
+def records() -> List[OperationRecord]:
+    return get_records()
+
 
 def wrap(obj: Any) -> Any:
-    """
-    Manually wrap a DataFrame or sklearn estimator in the appropriate proxy.
-
-    Examples
-    --------
-    >>> scaler = provtrack.wrap(StandardScaler())
-    >>> df = provtrack.wrap(pd.read_csv("data.csv"))  # auto-wrapped if active
-    """
     if pd is not None and isinstance(obj, pd.DataFrame):
         return DataFrameProxy(obj)
     try:
-        from sklearn.base import BaseEstimator  # noqa: PLC0415
+        from sklearn.base import BaseEstimator
         if isinstance(obj, BaseEstimator):
             return EstimatorProxy(obj)
     except ImportError:
         pass
+
+    obj_mod = getattr(type(obj), "__module__", "")
+    if "pyspark" in obj_mod or hasattr(obj, "_jdf"):
+        return SparkProxy(obj)
+    if "torch" in obj_mod or "tensorflow" in obj_mod or hasattr(obj, "detach"):
+        return TensorProxy(obj)
+
     raise TypeError(
         f"provtrack.wrap() does not support {type(obj).__name__}. "
-        "Supported: pd.DataFrame, sklearn estimators."
+        "Supported: pd.DataFrame, sklearn estimators, PyTorch/TF tensors, PySpark DataFrames."
     )
-
-
-# ── report helpers (thin wrappers over graph/logger) ─────────────────────────
-
-def get_lineage() -> "ProvenanceGraph":  # type: ignore[name-defined]  # noqa: F821
-    """Return the current session's provenance graph."""
-    return get_graph()
-
-
-def get_records():
-    """Return all OperationRecords logged this session."""
-    return get_logger().all()

@@ -1,100 +1,141 @@
-"""
-provtrack.logger
-~~~~~~~~~~~~~~~~
-Records every intercepted operation into a structured OperationRecord.
-
-Design decisions:
-  - Immutable dataclass (frozen=True) so records can't be mutated after the
-    fact — audit integrity.
-  - inspect.stack() is called once per operation to capture the caller's
-    filename and line number from user code (not from our own proxy frames).
-  - Timestamps are UTC ISO-8601 strings — timezone-safe, JSON-serialisable.
-  - The logger is a singleton per-process to avoid multiple graphs diverging.
-    Call provtrack.reset() to get a clean slate (used in tests).
-  - Thread-safe: all mutations go through a threading.Lock.
-
-Security guardrails:
-  - Stack frames are captured but the full local variable state is NOT — we
-    only record filename, lineno, and function name.  No user data leaks into
-    the operation record.
-  - The global registry cannot be written to externally; consumers must go
-    through get_logger() / reset().
-"""
-
 from __future__ import annotations
 
 import inspect
+import json
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
-# ── OperationRecord ───────────────────────────────────────────────────────────
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OperationRecord:
-    """
-    Immutable record of a single intercepted operation.
+    id: str
+    op_name: str
+    output_hash: str
+    input_hash: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+    source_line: int = 0
+    source_file: str = ""
+    tags: Tuple[str, ...] = ()
+    args_repr: str = ""
+    kwargs_repr: str = ""
+    obj_type: str = ""
+    caller_func: str = ""
+    duration_ms: float = 0.0
 
-    Attributes
-    ----------
-    op_id      : Unique UUID for this operation node in the DAG.
-    op_name    : Method/function name (e.g. "dropna", "fit_transform").
-    obj_type   : Class name of the object the method was called on.
-    input_hash : SHA-256 of the input DataFrame/array state.
-    output_hash: SHA-256 of the output state (None if op had no DF output).
-    args_repr  : Truncated repr of positional args (no raw data).
-    kwargs_repr: Truncated repr of keyword args (no raw data).
-    caller_file: Source file where the user called this operation.
-    caller_line: Line number in user code.
-    caller_func: Function name in user code that triggered this.
-    timestamp  : UTC ISO-8601 when the operation completed.
-    duration_ms: Wall-clock ms the operation took (excludes hashing time).
-    tags       : Arbitrary string tags (e.g. "sklearn", "pandas").
-    """
-    op_id       : str
-    op_name     : str
-    obj_type    : str
-    input_hash  : str
-    output_hash : Optional[str]
-    args_repr   : str
-    kwargs_repr : str
-    caller_file : str
-    caller_line : int
-    caller_func : str
-    timestamp   : str
-    duration_ms : float
-    tags        : tuple = field(default_factory=tuple)
+    def __init__(
+        self,
+        id: Optional[str] = None,
+        op_name: str = "",
+        output_hash: Optional[str] = None,
+        input_hash: Optional[str] = None,
+        timestamp: Optional[Union[float, str]] = None,
+        source_line: Optional[int] = None,
+        source_file: Optional[str] = None,
+        tags: Union[Tuple[str, ...], List[str], str] = (),
+        args_repr: str = "",
+        kwargs_repr: str = "",
+        obj_type: str = "",
+        caller_func: str = "",
+        duration_ms: float = 0.0,
+        op_id: Optional[str] = None,
+        caller_line: Optional[int] = None,
+        caller_file: Optional[str] = None,
+    ) -> None:
+        rec_id = id or op_id or str(uuid.uuid4())
+        s_line = source_line if source_line is not None else (caller_line if caller_line is not None else 0)
+        s_file = source_file if source_file is not None else (caller_file or "")
 
-    def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        d["tags"] = list(d["tags"])
-        return d
+        ts_val: float
+        if timestamp is None:
+            ts_val = time.time()
+        elif isinstance(timestamp, (int, float)):
+            ts_val = float(timestamp)
+        elif isinstance(timestamp, str):
+            try:
+                dt = datetime.fromisoformat(timestamp)
+                ts_val = dt.timestamp()
+            except ValueError:
+                try:
+                    ts_val = float(timestamp)
+                except ValueError:
+                    ts_val = time.time()
+        else:
+            ts_val = time.time()
+
+        tags_val: Tuple[str, ...]
+        if isinstance(tags, tuple):
+            tags_val = tags
+        elif isinstance(tags, list):
+            tags_val = tuple(tags)
+        elif isinstance(tags, str):
+            try:
+                parsed = json.loads(tags)
+                tags_val = tuple(parsed) if isinstance(parsed, list) else (tags,)
+            except (json.JSONDecodeError, ValueError):
+                tags_val = tuple(t.strip() for t in tags.split(",") if t.strip()) if tags else ()
+        else:
+            tags_val = ()
+
+        object.__setattr__(self, "id", str(rec_id))
+        object.__setattr__(self, "op_name", str(op_name))
+        object.__setattr__(self, "output_hash", str(output_hash or ""))
+        object.__setattr__(self, "input_hash", str(input_hash) if input_hash is not None else None)
+        object.__setattr__(self, "timestamp", ts_val)
+        object.__setattr__(self, "source_line", int(s_line))
+        object.__setattr__(self, "source_file", str(s_file))
+        object.__setattr__(self, "tags", tags_val)
+        object.__setattr__(self, "args_repr", str(args_repr))
+        object.__setattr__(self, "kwargs_repr", str(kwargs_repr))
+        object.__setattr__(self, "obj_type", str(obj_type))
+        object.__setattr__(self, "caller_func", str(caller_func))
+        object.__setattr__(self, "duration_ms", float(duration_ms))
+
+    @property
+    def op_id(self) -> str:
+        return self.id
+
+    @property
+    def caller_line(self) -> int:
+        return self.source_line
+
+    @property
+    def caller_file(self) -> str:
+        return self.source_file
 
     @property
     def short_op_id(self) -> str:
-        return self.op_id[:8]
+        return self.id[:8]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "op_id": self.id,
+            "op_name": self.op_name,
+            "input_hash": self.input_hash,
+            "output_hash": self.output_hash,
+            "timestamp": self.timestamp,
+            "source_line": self.source_line,
+            "source_file": self.source_file,
+            "caller_line": self.source_line,
+            "caller_file": self.source_file,
+            "tags": list(self.tags),
+            "args_repr": self.args_repr,
+            "kwargs_repr": self.kwargs_repr,
+            "obj_type": self.obj_type,
+            "caller_func": self.caller_func,
+            "duration_ms": self.duration_ms,
+        }
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-_PROVTRACK_FILES = frozenset({
-    "proxy.py",
-    "logger.py",
-    "hasher.py",
-    "graph.py",
-    "activate.py",
-    "__init__.py",
-})
-
+_PROVTRACK_MODULE_MARKERS = ("provtrack",)
 _MAX_REPR_LEN = 120
 
 
 def _safe_repr(obj: Any) -> str:
-    """Repr that never raises and is bounded in length."""
     try:
         r = repr(obj)
     except Exception:
@@ -105,86 +146,64 @@ def _safe_repr(obj: Any) -> str:
 
 
 def _caller_frame() -> tuple[str, int, str]:
-    """
-    Walk the call stack upward until we find a frame from user code
-    (i.e. not from provtrack's own modules).
-
-    Returns (filename, lineno, funcname).
-    """
     stack = inspect.stack()
     for frame_info in stack:
         fname = frame_info.filename
-        # Skip frames that belong to provtrack itself.
-        if any(fname.endswith(pt) for pt in _PROVTRACK_FILES):
+        if any(marker in fname for marker in _PROVTRACK_MODULE_MARKERS):
             continue
-        # Skip the Python stdlib internals.
         if "importlib" in fname or "<frozen" in fname:
             continue
         return fname, frame_info.lineno, frame_info.function
-    # Fallback — shouldn't happen in practice.
     return "<unknown>", 0, "<unknown>"
 
 
-# ── ProvenanceLogger ──────────────────────────────────────────────────────────
-
 class ProvenanceLogger:
-    """
-    Thread-safe singleton that accumulates OperationRecords for one session.
-
-    Usage
-    -----
-    logger = get_logger()
-    logger.record(op_name="dropna", obj_type="DataFrame", ...)
-    records = logger.all()
-    """
-
     def __init__(self) -> None:
         self._records: List[OperationRecord] = []
         self._lock = threading.Lock()
         self._enabled = True
-
-    # ── public API ────────────────────────────────────────────────────────────
 
     def record(
         self,
         *,
         op_name: str,
         obj_type: str,
-        input_hash: str,
+        input_hash: Optional[str],
         output_hash: Optional[str],
         args: tuple = (),
         kwargs: dict | None = None,
         duration_ms: float = 0.0,
         tags: tuple = (),
+        source_file: Optional[str] = None,
+        source_line: Optional[int] = None,
+        caller_func: Optional[str] = None,
     ) -> OperationRecord:
-        """
-        Build and store a new OperationRecord.  Returns the record so the
-        caller (proxy.py) can pass the op_id to graph.py immediately.
-        """
         if not self._enabled:
-            raise RuntimeError(
-                "provtrack: logger is disabled. Call provtrack.activate() first."
-            )
+            raise RuntimeError("provtrack: logger is disabled. Call provtrack.activate() first.")
 
         if kwargs is None:
             kwargs = {}
 
-        caller_file, caller_line, caller_func = _caller_frame()
+        if source_file is None or source_line is None:
+            c_file, c_line, c_func = _caller_frame()
+            source_file = source_file or c_file
+            source_line = source_line if source_line is not None else c_line
+            caller_func = caller_func or c_func
 
         rec = OperationRecord(
-            op_id       = str(uuid.uuid4()),
-            op_name     = op_name,
-            obj_type    = obj_type,
-            input_hash  = input_hash,
-            output_hash = output_hash,
-            args_repr   = _safe_repr(args),
-            kwargs_repr = _safe_repr(kwargs),
-            caller_file = caller_file,
-            caller_line = caller_line,
-            caller_func = caller_func,
-            timestamp   = datetime.now(timezone.utc).isoformat(),
-            duration_ms = round(duration_ms, 3),
-            tags        = tuple(tags),
+            id=str(uuid.uuid4()),
+            op_name=op_name,
+            obj_type=obj_type,
+            input_hash=input_hash,
+            output_hash=output_hash or "",
+            args_repr=_safe_repr(args),
+            kwargs_repr=_safe_repr(kwargs),
+            source_file=source_file,
+            source_line=source_line,
+            caller_func=caller_func or "",
+            timestamp=time.time(),
+            duration_ms=round(duration_ms, 3),
+            tags=tuple(tags),
         )
 
         with self._lock:
@@ -193,12 +212,10 @@ class ProvenanceLogger:
         return rec
 
     def all(self) -> List[OperationRecord]:
-        """Return a snapshot of all records (thread-safe copy)."""
         with self._lock:
             return list(self._records)
 
     def clear(self) -> None:
-        """Discard all records (used by provtrack.reset())."""
         with self._lock:
             self._records.clear()
 
@@ -213,18 +230,12 @@ class ProvenanceLogger:
         with self._lock:
             return len(self._records)
 
-    def __repr__(self) -> str:
-        return f"<ProvenanceLogger records={self.count} enabled={self._enabled}>"
-
-
-# ── module-level singleton ────────────────────────────────────────────────────
 
 _logger_instance: Optional[ProvenanceLogger] = None
 _singleton_lock = threading.Lock()
 
 
 def get_logger() -> ProvenanceLogger:
-    """Return (or lazily create) the process-wide ProvenanceLogger."""
     global _logger_instance
     if _logger_instance is None:
         with _singleton_lock:
@@ -234,10 +245,6 @@ def get_logger() -> ProvenanceLogger:
 
 
 def reset_logger() -> None:
-    """
-    Discard the current session's records and create a fresh logger.
-    Used in tests and when the user calls provtrack.reset().
-    """
     global _logger_instance
     with _singleton_lock:
         _logger_instance = ProvenanceLogger()

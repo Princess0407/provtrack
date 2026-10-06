@@ -1,3 +1,0 @@
-{
-  "tests/test_proxy.py::test_getitem_intercepted": true
-}

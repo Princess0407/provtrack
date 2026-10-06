@@ -4,14 +4,14 @@ provtrack setup.py
 pip install provtrack
 """
 
-import setuptools
 from pathlib import Path
+import setuptools
 
 long_description = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
 
 setuptools.setup(
     name="provtrack",
-    version="0.1.0",
+    version="2.0.0",
     description=(
         "Zero-instrumentation ML pipeline provenance tracking. "
         "One line of code. Full data lineage."
@@ -19,7 +19,7 @@ setuptools.setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Princess",
-    author_email="priyankatiwari140419@gmail.com",              
+    author_email="priyankatiwari140419@gmail.com",
     url="https://github.com/Princess0407/provtrack",
     project_urls={
         "Bug Tracker": "https://github.com/Princess0407/provtrack/issues",
@@ -28,7 +28,7 @@ setuptools.setup(
     },
     license="Apache-2.0",
     classifiers=[
-        "Development Status :: 3 - Alpha",
+        "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
         "License :: OSI Approved :: Apache Software License",
@@ -38,6 +38,7 @@ setuptools.setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "Topic :: Software Development :: Libraries :: Python Modules",
     ],
@@ -60,11 +61,16 @@ setuptools.setup(
     ],
     extras_require={
         "sklearn": ["scikit-learn>=0.24"],
+        "serve": ["fastapi>=0.100.0", "uvicorn>=0.20.0"],
+        "postgres": ["psycopg2-binary>=2.9.0"],
+        "s3": ["boto3>=1.20.0"],
         "dev": [
             "pytest>=7.0",
             "pytest-cov>=4.0",
             "scikit-learn>=0.24",
             "numpy>=1.21",
+            "fastapi",
+            "uvicorn",
         ],
         "viz": [
             "matplotlib>=3.4",
