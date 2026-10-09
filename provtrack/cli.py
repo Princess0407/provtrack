@@ -222,6 +222,26 @@ def cmd_serve(args: argparse.Namespace) -> None:
     uvicorn.run(app, host=args.host, port=args.port)
 
 
+def tui(
+    file: Optional[Path] = None,
+    a: Optional[Path] = None,
+    b: Optional[Path] = None,
+) -> None:
+    if not file and not (a and b):
+        _die("Pass --file for DAG view or --a/--b for diff view.")
+    from provtrack.tui.app import ProvtrackApp
+
+    app = ProvtrackApp(session_file=file, diff_a=a, diff_b=b)
+    app.run()
+
+
+def cmd_tui(args: argparse.Namespace) -> None:
+    file = Path(args.file) if args.file else None
+    a = Path(args.a) if args.a else None
+    b = Path(args.b) if args.b else None
+    tui(file=file, a=a, b=b)
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         prog="provtrack",
@@ -268,6 +288,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_serve.add_argument("--host", default="127.0.0.1", help="Host interface to bind")
     p_serve.add_argument("--max-size", type=int, default=_MAX_FILE_BYTES, help="Max file size in bytes")
     p_serve.set_defaults(func=cmd_serve)
+
+    p_tui = subparsers.add_parser("tui", help="Launch interactive Terminal UI")
+    p_tui.add_argument("--file", "-f", default=None, help="Path to session JSON file")
+    p_tui.add_argument("--a", default=None, help="Session A JSON file for diff")
+    p_tui.add_argument("--b", default=None, help="Session B JSON file for diff")
+    p_tui.set_defaults(func=cmd_tui)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "func"):

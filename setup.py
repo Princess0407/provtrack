@@ -58,6 +58,8 @@ setuptools.setup(
     install_requires=[
         "pandas>=1.3.0",
         "networkx>=2.6",
+        "textual>=0.47.0",
+        "pyperclip>=1.8.0",
     ],
     extras_require={
         "sklearn": ["scikit-learn>=0.24"],
