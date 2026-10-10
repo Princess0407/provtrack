@@ -55,7 +55,6 @@ provtrack.activate()
 import pandas as pd
 
 df = pd.read_csv("titanic.csv")
-df = provtrack.wrap(df)
 
 df = df.dropna(subset=["Age", "Embarked"])
 df = df[df["Age"] > 18]
@@ -75,6 +74,8 @@ Operation breakdown:
   rename      1x   avg 0.8 ms
 ```
 
+No `provtrack.wrap()`. No decorators. No rewriting your pipeline. On Python 3.12+, `activate()` hooks into the Python VM via `sys.monitoring` and intercepts every pandas and sklearn call at the bytecode level.
+
 The graph as a Mermaid diagram:
 
 ```
@@ -90,48 +91,42 @@ The hashes on the edges are SHA-256 fingerprints of the DataFrame state at that 
 
 ## How it works
 
-provtrack has four layers. Each does exactly one job.
+provtrack selects its tracing strategy based on the Python version at activation time.
 
+### Python 3.12+ — sys.monitoring (PEP 669)
+
+On Python 3.12 and above, provtrack uses `sys.monitoring` as the primary tracing layer. This is a low-overhead VM-level event API introduced in PEP 669. provtrack registers a tool ID and subscribes to `CALL` and `PY_RETURN` events:
+
+```python
+import sys
+
+TOOL_ID = 1
+
+def _on_call(code, instruction_offset, callable_, arg0):
+    module = getattr(callable_, "__module__", "") or ""
+    if "pandas" not in module and "sklearn" not in module:
+        return sys.monitoring.DISABLE
+    _pending_calls[id(callable_)] = (getattr(callable_, "__qualname__", ""), module)
+
+def _on_return(code, instruction_offset, retval):
+    if isinstance(retval, pd.DataFrame):
+        # hash retval, log OperationRecord, build DAG edge
+
+sys.monitoring.use_tool_id(TOOL_ID, "provtrack")
+sys.monitoring.set_events(TOOL_ID, sys.monitoring.events.CALL | sys.monitoring.events.PY_RETURN)
+sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.CALL, _on_call)
+sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.PY_RETURN, _on_return)
 ```
-Your code
-    |
-    v
-Layer 4: activate.py
-Patches pd.read_csv, pd.read_parquet, etc.
-Returns DataFrameProxy instead of DataFrame
-    |
-    v
-Layer 3: proxy.py
-DataFrameProxy.__getattr__ intercepts every call
-Calls the real method, re-wraps the result
-Records (op_name, input_hash, output_hash, line)
-    |
-    v
-Layer 2: hasher.py + logger.py
-SHA-256 fingerprint of each DataFrame state
-Immutable OperationRecord stored in thread-safe singleton
-    |
-    v
-Layer 1: graph.py
-NetworkX DiGraph. Nodes = operations.
-Edges = data flows, linked by hash identity.
-output_hash(A) == input_hash(B) => edge A->B
-```
 
-### Proxy
+`sys.monitoring.DISABLE` is returned immediately for any callable outside pandas or sklearn, so tracing overhead on the rest of your code is zero. Pending calls are tracked in a thread-local dict so threaded pipelines are handled correctly.
 
-`DataFrameProxy` is a transparent wrapper around `pd.DataFrame`. It uses `__slots__` to prevent attribute shadowing, `__class__` spoofing so `isinstance(proxy, pd.DataFrame)` returns `True` for sklearn compatibility, and `object.__getattribute__` for all internal access to avoid recursion.
+This is what makes `provtrack.wrap()` unnecessary on Python 3.12+. The VM intercepts every return value regardless of how the DataFrame was assigned.
 
-When you call `df.dropna()` on a proxy:
+### Python 3.8-3.11 — proxy fallback
 
-1. `__getattr__("dropna")` fires and returns a wrapper function
-2. The wrapper hashes the current DataFrame state (input hash)
-3. The real `dropna()` runs on the underlying frame
-4. The result is hashed (output hash)
-5. An `OperationRecord` is logged with op name, both hashes, and the source line number
-6. The result is re-wrapped as a new `DataFrameProxy`
+On Python 3.8-3.11, `sys.monitoring` is not available. provtrack falls back to a `DataFrameProxy` via `__getattr__` interception. In this mode, `provtrack.wrap(df)` is required for DataFrames loaded before `activate()`. DataFrames returned from patched pandas I/O functions (`pd.read_csv`, `pd.read_parquet`, etc.) are wrapped automatically.
 
-This means `df.dropna().reset_index().rename(columns={"a": "b"})` generates three records with correctly linked hashes, with zero changes to your code.
+The fallback is selected transparently at `activate()` time. Your code does not need to branch.
 
 ### Hashing
 
@@ -139,7 +134,7 @@ Every DataFrame state is fingerprinted with `pd.util.hash_pandas_object`, which 
 
 Python's built-in `hash()` is not used anywhere. It is randomised per process by `PYTHONHASHSEED` and cannot be compared across runs.
 
-For DataFrames over 100,000 rows, provtrack hashes a seeded reservoir sample to bound latency to approximately 25ms regardless of file size.
+For DataFrames over 100,000 rows, provtrack hashes a seeded reservoir sample to bound latency to approximately 25ms regardless of file size. The sample is deterministic, so the same data always produces the same hash.
 
 ### Graph
 
@@ -196,7 +191,7 @@ Four screens, keyboard navigable:
 | Diff view | `2` | Side-by-side comparison of two pipeline runs |
 | Hash inspector | `3` | Every operation that touched a specific data state |
 
-The TUI uses a slate grey and charcoal black color palette. No bright colors. Runs entirely in the terminal.
+The TUI uses a slate grey and charcoal black color palette. No bright colors. Runs entirely in the terminal with no browser dependency.
 
 ---
 
@@ -218,10 +213,6 @@ provtrack.activate(backend="postgres")
 # Object storage
 provtrack.activate(backend="s3", bucket="my-lineage-bucket")
 ```
-
----
-
-## Backends comparison
 
 | Backend | Persists | Cross-process | Team-scale | Setup |
 |---|---|---|---|---|
@@ -248,18 +239,18 @@ provtrack.activate(backend="s3", bucket="my-lineage-bucket")
 ```python
 # Activation
 provtrack.activate(
-    backend="memory",       # memory | sqlite | postgres | s3
+    backend="memory",           # memory | sqlite | postgres | s3
     patch_sklearn=True,
     patch_pandas_readers=True,
     verbose=False,
 )
 provtrack.deactivate()
-provtrack.reset()           # clear all records, keep activation
-provtrack.is_active()       # bool
+provtrack.reset()               # clear all records, keep activation
+provtrack.is_active()           # bool
 
-# Wrapping
-provtrack.wrap(df)          # pd.DataFrame -> DataFrameProxy
-provtrack.wrap(estimator)   # sklearn estimator -> EstimatorProxy
+# Wrapping (required on Python 3.8-3.11 only)
+provtrack.wrap(df)              # pd.DataFrame -> DataFrameProxy
+provtrack.wrap(estimator)       # sklearn estimator -> EstimatorProxy
 
 # Querying
 graph = provtrack.lineage()
@@ -288,14 +279,14 @@ graph.is_valid_dag()
 
 Overhead is bounded by the SHA-256 hash of the DataFrame after each operation.
 
-| DataFrame size | Hash time | Proxy overhead per call |
+| DataFrame size | Hash time | Tracing overhead per call |
 |---|---|---|
 | 1K rows x 10 cols | 0.3 ms | 0.01 ms |
 | 10K rows x 10 cols | 2.1 ms | 0.01 ms |
 | 100K rows x 10 cols | 25 ms | 0.01 ms |
 | 1M+ rows | ~25 ms (sampled) | 0.01 ms |
 
-For large DataFrames, provtrack samples 100,000 rows with a fixed seed before hashing. The sample is deterministic, so the same data always produces the same hash. The sampling threshold is configurable.
+On Python 3.12+, `sys.monitoring` returns `DISABLE` immediately for any non-pandas/sklearn callable, so overhead on the rest of your code is zero. On Python 3.8-3.11, the proxy layer adds one `__getattr__` dispatch per pandas call.
 
 ---
 
@@ -307,11 +298,11 @@ For large DataFrames, provtrack samples 100,000 rows with a fixed seed before ha
 
 **No eval or exec.** The codebase has zero uses of `eval`, `exec`, or `__import__`. The CLI parses JSON with strict mode and validates file size before reading.
 
-**Pickle blocked on proxies.** `DataFrameProxy.__reduce__` raises `TypeError`. Call `proxy.unwrap()` before pickling.
+**Pickle blocked on proxies.** `DataFrameProxy.__reduce__` raises `TypeError` on Python 3.8-3.11. Call `proxy.unwrap()` before pickling.
 
-**Thread-safe logger.** All record mutations go through a `threading.Lock`. Safe for multi-threaded preprocessing pipelines.
+**Thread-safe logger.** All record mutations go through a `threading.Lock`. Safe for multi-threaded preprocessing pipelines. On Python 3.12+, pending call state is stored in a thread-local dict.
 
-**Reversible activation.** `provtrack.deactivate()` fully restores all original pandas callables. Calling `activate()` twice is safe.
+**Reversible activation.** `provtrack.deactivate()` unregisters the `sys.monitoring` tool ID and restores all patched pandas callables. Calling `activate()` twice is safe.
 
 ---
 
@@ -325,7 +316,7 @@ For large DataFrames, provtrack samples 100,000 rows with a fixed seed before ha
 | Vamsa | Static analysis | No | No | No | No |
 | DataLineagePy | Runtime proxy | Yes | No | No | No |
 | yProv4ML | Explicit logging | No | No | No | Yes |
-| **provtrack** | **Runtime proxy** | **Yes** | **Yes** | **Yes** | **Yes** |
+| **provtrack** | **VM-level tracing** | **Yes** | **Yes** | **Yes** | **Yes** |
 
 ---
 
@@ -336,18 +327,18 @@ provtrack/
 ├── provtrack/
 │   ├── _version.py          version string, single source of truth
 │   ├── __init__.py          public API
-│   ├── activate.py          patches pandas I/O, public API entry point
-│   ├── hasher.py            SHA-256 fingerprinting
+│   ├── activate.py          sys.monitoring setup, version guard, public API entry point
+│   ├── hasher.py            SHA-256 fingerprinting (v1 core, used by hashers/)
 │   ├── logger.py            immutable OperationRecord, thread-safe singleton
-│   ├── graph.py             NetworkX DAG
-│   ├── proxy.py             DataFrameProxy, EstimatorProxy
+│   ├── graph.py             NetworkX DAG (v1 core, used by graph/)
+│   ├── proxy.py             DataFrameProxy, EstimatorProxy (Python 3.8-3.11 fallback)
 │   ├── cli.py               report/export/query/diff/validate/tui commands
-│   ├── hashers/             pluggable hasher layer (v2)
-│   ├── proxies/             pluggable proxy layer (v2)
-│   ├── backends/            memory/sqlite/postgres/s3 (v2)
-│   ├── graph/               builder/query/diff/replay (v2)
-│   ├── exporters/           json/dot/mermaid/openlineage (v2)
-│   └── tui/                 Textual terminal UI (v3)
+│   ├── hashers/             pluggable hasher layer — dataframe, tensor, array, fast
+│   ├── proxies/             pluggable proxy layer — estimator, tensor, spark
+│   ├── backends/            memory/sqlite/postgres/s3
+│   ├── graph/               builder/query/diff/replay
+│   ├── exporters/           json/dot/mermaid/openlineage
+│   └── tui/                 Textual terminal UI — four screens, slate/charcoal theme
 ├── tests/
 │   ├── test_hasher.py       28 tests
 │   ├── test_proxy.py        17 tests
@@ -355,7 +346,7 @@ provtrack/
 ├── .github/
 │   ├── workflows/
 │   │   ├── ci.yml           test matrix Python 3.8-3.12
-│   │   └── publish.yml      PyPI publish on version tag
+│   │   └── publish.yml      PyPI publish on version tag via OIDC
 │   └── ISSUE_TEMPLATE/
 │       ├── bug_report.md
 │       └── feature_request.md
@@ -387,14 +378,16 @@ All 64 tests should pass. If you are adding a feature, add a test first. If you 
 
 **Foundation:** pandas DataFrameProxy, sklearn EstimatorProxy, NetworkX DAG, CLI, session JSON export, Mermaid/DOT/JSON export formats, 64 passing tests.
 
-**Base version(released):** `sys.monitoring` (PEP 669, Python 3.12+) as the primary tracing layer with v1 proxy fallback for Python 3.8-3.11. Pluggable storage backends (memory, SQLite, PostgreSQL, S3). OpenLineage export format. PySpark and tensor proxies. Modular hasher and exporter architecture.
+**Base version (released):** `sys.monitoring` (PEP 669, Python 3.12+) as the primary tracing layer with proxy fallback for Python 3.8-3.11. Pluggable storage backends (memory, SQLite, PostgreSQL, S3). OpenLineage export format. PySpark and tensor proxies. Modular hasher and exporter architecture.
 
 **v1.0 (released):** Textual terminal UI with four interactive screens. Slate/charcoal dark theme. Keyboard-navigable DAG view, operation detail, side-by-side diff, and hash inspector. PyPI packaging with trusted publishing via OIDC.
 
-**v1.2(planned):** Cryptographic signatures on records for tamper detection. Team-scale graph database backend.
+**v1.2 (planned):** Cryptographic signatures on records for tamper detection. Team-scale graph database backend.
 
 ---
 
 ## License
 
-Apache 2.0.[LICENSE](https://github.com/Princess0407/provtrack/blob/main/LICENSE).
+Apache 2.0. See [LICENSE](https://github.com/Princess0407/provtrack/blob/main/LICENSE).
+
+Built by [Princess](https://github.com/Princess0407).
