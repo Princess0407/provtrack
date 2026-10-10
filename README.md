@@ -14,7 +14,6 @@
 
 </div>
 
----
 
 MLflow tracks your hyperparameters. It does not track what happened to your data between `pd.read_csv()` and `model.fit()`. That gap is where debugging takes hours. provtrack closes it.
 
@@ -55,7 +54,6 @@ flowchart LR
 
 The hashes on the edges are SHA-256 fingerprints of the DataFrame state at that point. If your data changes between runs, the hash changes. That is how you know something upstream broke your pipeline.
 
----
 
 ## The problem this solves
 
@@ -65,7 +63,6 @@ You have git history for your code. You have MLflow for your hyperparameters. Bu
 
 provtrack answers these questions without any manual logging. Every intermediate DataFrame state is fingerprinted. Every operation is recorded with the line number it came from. You can diff two pipeline runs and see exactly where the data diverged.
 
----
 
 ## Install
 
@@ -81,7 +78,6 @@ pip install provtrack[sklearn]
 
 Requirements: Python 3.8+, pandas 1.3+, networkx 2.6+
 
----
 
 ## Quickstart
 
@@ -122,7 +118,6 @@ with open("session.json", "w") as f:
     f.write(graph.to_json())
 ```
 
----
 
 ## CLI
 
@@ -157,8 +152,6 @@ provtrack validate --file session.json
 ```
 
 The diff command is the one you actually want when something breaks in production. It shows you which operations exist in one run but not the other, so you know exactly where the pipelines diverged.
-
----
 
 ## How it works
 
@@ -228,7 +221,6 @@ The graph links nodes by hash identity: if operation A's output hash equals oper
 
 Deduplication is applied at write time: if two calls produce the same `(op_name, input_hash, output_hash)` triple, only the first is kept. This prevents internal pandas operations from appearing as duplicate nodes.
 
----
 
 ## Comparison
 
@@ -243,7 +235,6 @@ Deduplication is applied at write time: if two calls produce the same `(op_name,
 
 The key difference from DataLineagePy: provtrack's proxy is applied at the library level via `activate()`, not at the variable level. You do not need to wrap every assignment. You add one line at the top of your script and every DataFrame in the session is tracked.
 
----
 
 ## Performance
 
@@ -258,7 +249,6 @@ Overhead is bounded by the SHA-256 hash of the DataFrame after each operation. O
 
 For large DataFrames, provtrack samples 100,000 rows with a fixed seed before hashing. The sample is deterministic, so the same data always produces the same hash. The sampling threshold is configurable.
 
----
 
 ## Security
 
@@ -276,7 +266,6 @@ provtrack is designed for production use. These are not afterthoughts.
 
 **Reversible activation.** `provtrack.deactivate()` fully restores all original pandas callables from the stored patch table. Activation is idempotent -- calling `activate()` twice is safe.
 
----
 
 ## API reference
 
@@ -311,7 +300,6 @@ graph.ops_touching_data(hash)
 graph.is_valid_dag()
 ```
 
----
 
 ## Project structure
 
@@ -334,7 +322,6 @@ provtrack/
 └── setup.py
 ```
 
----
 
 ## Contributing
 
@@ -350,7 +337,6 @@ pytest tests/ -v
 
 All 64 tests should pass. If you are adding a new feature, add a test first. If you are fixing a bug, add the bug to EDGE_CASES.md with the fix and a test reference.
 
----
 
 ## Roadmap
 
@@ -360,10 +346,8 @@ All 64 tests should pass. If you are adding a new feature, add a test first. If 
 
 **v3:** Web UI for interactive DAG exploration. Team-scale graph database backing. Cryptographic signatures on records for tamper detection.
 
----
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+Apache 2.0 [LICENSE](LICENSE)
 
-Built by [Princess](https://github.com/Princess0407).
