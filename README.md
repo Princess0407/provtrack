@@ -93,7 +93,7 @@ The hashes on the edges are SHA-256 fingerprints of the DataFrame state at that 
 
 provtrack selects its tracing strategy based on the Python version at activation time.
 
-### Python 3.12+ — sys.monitoring (PEP 669)
+### Python 3.12+ sys.monitoring (PEP 669)
 
 On Python 3.12 and above, provtrack uses `sys.monitoring` as the primary tracing layer. This is a low-overhead VM-level event API introduced in PEP 669. provtrack registers a tool ID and subscribes to `CALL` and `PY_RETURN` events:
 
@@ -122,7 +122,7 @@ sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.PY_RETURN, _on_r
 
 This is what makes `provtrack.wrap()` unnecessary on Python 3.12+. The VM intercepts every return value regardless of how the DataFrame was assigned.
 
-### Python 3.8-3.11 — proxy fallback
+### Python 3.8-3.11 proxy fallback
 
 On Python 3.8-3.11, `sys.monitoring` is not available. provtrack falls back to a `DataFrameProxy` via `__getattr__` interception. In this mode, `provtrack.wrap(df)` is required for DataFrames loaded before `activate()`. DataFrames returned from patched pandas I/O functions (`pd.read_csv`, `pd.read_parquet`, etc.) are wrapped automatically.
 
