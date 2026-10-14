@@ -8,13 +8,12 @@
 [![pandas](https://img.shields.io/badge/pandas-1.3%2B-informational)](https://pandas.pydata.org/)
 [![sklearn](https://img.shields.io/badge/sklearn-0.24%2B-informational)](https://scikit-learn.org/)
 
-Zero-instrumentation ML pipeline provenance tracking.
+Zero instrumentation ML pipeline provenance tracking.
 
 MLflow tracks your hyperparameters. It does not track what happened to your data between `pd.read_csv()` and `model.fit()`. That gap is where debugging takes hours. provtrack closes it.
 
 Add one line to your script. Get a complete, cryptographically linked DAG of every operation that touched your data, from the raw file to the trained model.
 
----
 
 ## The problem
 
@@ -24,7 +23,6 @@ You have git history for your code. You have MLflow for your hyperparameters. Yo
 
 provtrack answers these questions without any manual logging. Every intermediate DataFrame state is fingerprinted. Every operation is recorded with the line number it came from. You can diff two pipeline runs and see exactly where the data diverged.
 
----
 
 ## Install
 
@@ -44,7 +42,6 @@ pip install provtrack[all]        # everything
 
 Requirements: Python 3.8+, pandas 1.3+, networkx 2.6+
 
----
 
 ## Quickstart
 
@@ -87,7 +84,6 @@ flowchart LR
 
 The hashes on the edges are SHA-256 fingerprints of the DataFrame state at that point. If your data changes between runs, the hash changes. That is how you know something upstream broke your pipeline.
 
----
 
 ## How it works
 
@@ -142,7 +138,6 @@ The graph links nodes by hash identity: if operation A's output hash equals oper
 
 Deduplication is applied at write time: if two calls produce the same `(op_name, input_hash, output_hash)` triple, only the first is kept.
 
----
 
 ## CLI
 
@@ -172,7 +167,6 @@ provtrack tui --file session.json
 provtrack tui --a session_v1.json --b session_v2.json
 ```
 
----
 
 ## Terminal UI
 
@@ -193,7 +187,6 @@ Four screens, keyboard navigable:
 
 The TUI uses a slate grey and charcoal black color palette. No bright colors. Runs entirely in the terminal with no browser dependency.
 
----
 
 ## Storage backends
 
@@ -221,7 +214,6 @@ provtrack.activate(backend="s3", bucket="my-lineage-bucket")
 | postgres | Yes | Yes | Yes | DSN env var |
 | s3 | Yes | Yes | Yes | AWS credentials |
 
----
 
 ## Export formats
 
@@ -232,7 +224,6 @@ provtrack.activate(backend="s3", bucket="my-lineage-bucket")
 | `dot` | Graphviz, pipe through `dot -Tpng` for an image |
 | `openlineage` | Industry standard, compatible with Airflow, Spark, dbt |
 
----
 
 ## API reference
 
@@ -273,7 +264,6 @@ graph.ops_touching_data(hash)
 graph.is_valid_dag()
 ```
 
----
 
 ## Performance
 
@@ -288,7 +278,6 @@ Overhead is bounded by the SHA-256 hash of the DataFrame after each operation.
 
 On Python 3.12+, `sys.monitoring` returns `DISABLE` immediately for any non-pandas/sklearn callable, so overhead on the rest of your code is zero. On Python 3.8-3.11, the proxy layer adds one `__getattr__` dispatch per pandas call.
 
----
 
 ## Security
 
@@ -304,7 +293,6 @@ On Python 3.12+, `sys.monitoring` returns `DISABLE` immediately for any non-pand
 
 **Reversible activation.** `provtrack.deactivate()` unregisters the `sys.monitoring` tool ID and restores all patched pandas callables. Calling `activate()` twice is safe.
 
----
 
 ## Comparison
 
@@ -318,7 +306,6 @@ On Python 3.12+, `sys.monitoring` returns `DISABLE` immediately for any non-pand
 | yProv4ML | Explicit logging | No | No | No | Yes |
 | **provtrack** | **VM-level tracing** | **Yes** | **Yes** | **Yes** | **Yes** |
 
----
 
 ## Project structure
 
@@ -356,7 +343,6 @@ provtrack/
 └── LICENSE
 ```
 
----
 
 ## Contributing
 
@@ -372,7 +358,6 @@ pytest tests/ -v
 
 All 64 tests should pass. If you are adding a feature, add a test first. If you are fixing a bug, add it to `EDGE_CASES.md` with the fix and a test reference.
 
----
 
 ## Roadmap
 
@@ -384,10 +369,6 @@ All 64 tests should pass. If you are adding a feature, add a test first. If you 
 
 **v1.2 (planned):** Cryptographic signatures on records for tamper detection. Team-scale graph database backend.
 
----
-
 ## License
 
-Apache 2.0. See [LICENSE](https://github.com/Princess0407/provtrack/blob/main/LICENSE).
-
-Built by [Princess](https://github.com/Princess0407).
+Apache 2.0.[LICENSE](https://github.com/Princess0407/provtrack/blob/main/LICENSE).
