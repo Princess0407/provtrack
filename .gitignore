@@ -34,11 +34,8 @@ venv.bak/
 .idea/
 *.db
 lineage.db
-__pycache__/
-*.py[cod]
 *.egg-info/
 dist/
-build/
 .venv/
 venv/
 .pytest_cache/
