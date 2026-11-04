@@ -1,6 +1,6 @@
 # provtrack
 
-[![PyPI version](https://img.shields.io/pypi/v/provtrack.svg?color=blue)](https://pypi.org/project/provtrack/)
+[![PyPI version](https://img.shields.io/pypi/v/provtrack.svg?color=blue)](https://pypi.org/project/provtrack/2.0.0/)
 [![Python](https://img.shields.io/pypi/pyversions/provtrack.svg)](https://pypi.org/project/provtrack/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/Princess0407/provtrack/blob/main/LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/Princess0407/provtrack/ci.yml?label=CI)](https://github.com/Princess0407/provtrack/actions/workflows/ci.yml)
