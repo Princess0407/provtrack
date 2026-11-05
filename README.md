@@ -10,7 +10,7 @@
 
 Zero instrumentation ML pipeline provenance tracking.
 
-MLflow tracks your hyperparameters. It does not track what happened to your data between `pd.read_csv()` and `model.fit()`. That gap is where debugging takes hours. provtrack closes it.
+MLflow tracks all your hyperparameters. It does not track what happened to your data between `pd.read_csv()` and `model.fit()`. That gap is where debugging takes hours. provtrack closes it.
 
 Add one line to your script. Get a complete, cryptographically linked DAG of every operation that touched your data, from the raw file to the trained model.
 
