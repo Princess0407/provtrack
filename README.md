@@ -3,7 +3,6 @@
 [![PyPI version](https://img.shields.io/pypi/v/provtrack.svg?color=blue)](https://pypi.org/project/provtrack/2.0.0/)
 [![Python](https://img.shields.io/pypi/pyversions/provtrack.svg)](https://pypi.org/project/provtrack/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/Princess0407/provtrack/blob/main/LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/Princess0407/provtrack/ci.yml?label=CI)](https://github.com/Princess0407/provtrack/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-94%25-brightgreen.svg)](https://github.com/Princess0407/provtrack)
 [![pandas](https://img.shields.io/badge/pandas-1.3%2B-informational)](https://pandas.pydata.org/)
 [![sklearn](https://img.shields.io/badge/sklearn-0.24%2B-informational)](https://scikit-learn.org/)
